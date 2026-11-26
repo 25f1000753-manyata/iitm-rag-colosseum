@@ -1,21 +1,17 @@
-
 import json
 import re
 from pathlib import Path
 
-import faiss
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from starlette.concurrency import run_in_threadpool
-
 
 # --------------------------------------------------
 # Configuration
 # --------------------------------------------------
-
 BASE_DIR = Path(__file__).resolve().parent
 KB_PATH = BASE_DIR / "knowledge_base.json"
 
@@ -37,7 +33,6 @@ app.add_middleware(
 # --------------------------------------------------
 # Request model
 # --------------------------------------------------
-
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: int = Field(default=TOP_K, ge=1, le=20)
@@ -46,7 +41,6 @@ class QueryRequest(BaseModel):
 # --------------------------------------------------
 # Load knowledge base and embedding model
 # --------------------------------------------------
-
 if not KB_PATH.exists():
     raise FileNotFoundError(f"Knowledge base not found: {KB_PATH}")
 
@@ -64,53 +58,38 @@ if not knowledge_base:
 
 print(f"Loaded {len(knowledge_base)} passages.")
 
-model = SentenceTransformer(MODEL_NAME, device="cpu")
+# FastEmbed uses ONNX Runtime instead of loading PyTorch.
+model = TextEmbedding(model_name=MODEL_NAME)
 
-embeddings = model.encode(
-    knowledge_base,
-    convert_to_numpy=True,
-    normalize_embeddings=True,
-    show_progress_bar=False,
-)
 
-embeddings = np.asarray(embeddings, dtype="float32")
+def embed_texts(texts):
+    """Return L2-normalized float32 embeddings."""
+    vectors = np.asarray(list(model.embed(texts)), dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / np.maximum(norms, 1e-12)
 
-index = faiss.IndexFlatIP(embeddings.shape[1])
-index.add(embeddings)
 
-print("FAISS index created successfully.")
+# Precompute passage embeddings once at startup.
+embeddings = embed_texts(knowledge_base)
+print("Knowledge-base embeddings created successfully.")
 
 
 # --------------------------------------------------
 # Retrieval
 # --------------------------------------------------
-
 def retrieve(question: str, top_k: int):
-    query_embedding = model.encode(
-        [question],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-
-    query_embedding = np.asarray(
-        query_embedding,
-        dtype="float32",
-    )
+    query_embedding = embed_texts([question])[0]
+    similarities = embeddings @ query_embedding
 
     k = min(top_k, len(knowledge_base))
-
-    scores, indices = index.search(query_embedding, k)
+    best_indices = np.argsort(similarities)[::-1][:k]
 
     retrieved = []
-
-    for score, passage_id in zip(scores[0], indices[0]):
-        if passage_id < 0:
-            continue
-
+    for passage_id in best_indices:
         retrieved.append({
             "passage_id": int(passage_id),
             "text": knowledge_base[int(passage_id)],
-            "score": float(score),
+            "score": float(similarities[passage_id]),
         })
 
     return retrieved
@@ -119,22 +98,18 @@ def retrieve(question: str, top_k: int):
 # --------------------------------------------------
 # Answer extraction
 # --------------------------------------------------
-
 def extract_answer(question: str, retrieved: list):
     if not retrieved:
         return None, [], [], 0.0
 
     sentences = []
-
     for item in retrieved:
         passage_sentences = re.split(
             r"(?<=[.!?])\s+",
             item["text"].strip(),
         )
-
         for sentence in passage_sentences:
             sentence = sentence.strip()
-
             if sentence:
                 sentences.append({
                     "text": sentence,
@@ -144,59 +119,32 @@ def extract_answer(question: str, retrieved: list):
     if not sentences:
         return None, [], [], 0.0
 
-    sentence_texts = [
-        item["text"] for item in sentences
-    ]
+    sentence_texts = [item["text"] for item in sentences]
+    sentence_embeddings = embed_texts(sentence_texts)
+    question_embedding = embed_texts([question])[0]
 
-    sentence_embeddings = model.encode(
-        sentence_texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-
-    question_embedding = model.encode(
-        [question],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-
-    similarities = np.dot(
-        sentence_embeddings,
-        question_embedding[0],
-    )
-
+    similarities = sentence_embeddings @ question_embedding
     best_index = int(np.argmax(similarities))
     best_sentence = sentences[best_index]
     best_sentence_score = float(similarities[best_index])
 
-    best_passage_id = best_sentence["passage_id"]
-
-    # Confidence calculation
     confidence = float(
-        np.clip(
-            (best_sentence_score - 0.20) / 0.60,
-            0.0,
-            1.0,
-        )
+        np.clip((best_sentence_score - 0.20) / 0.60, 0.0, 1.0)
     )
 
-    # Abstain when confidence is below the threshold
     if confidence < ABSTAIN_THRESHOLD:
         return None, [], [], round(confidence, 4)
 
-    # Cite the passage that actually contains the answer
+    best_passage_id = best_sentence["passage_id"]
     best_passage = next(
         item for item in retrieved
         if item["passage_id"] == best_passage_id
     )
 
-    source_ids = [best_passage["passage_id"]]
-    source_scores = [round(best_passage["score"], 4)]
-
     return (
         best_sentence["text"],
-        source_ids,
-        source_scores,
+        [best_passage_id],
+        [round(best_passage["score"], 4)],
         round(confidence, 4),
     )
 
@@ -204,12 +152,9 @@ def extract_answer(question: str, retrieved: list):
 # --------------------------------------------------
 # API endpoints
 # --------------------------------------------------
-
 @app.get("/")
 def root():
-    return {
-        "message": "RAG Colosseum API is running"
-    }
+    return {"message": "RAG Colosseum API is running"}
 
 
 @app.get("/health")
@@ -224,7 +169,6 @@ def health():
 @app.post("/query")
 async def query_endpoint(request: QueryRequest):
     question = request.question.strip()
-
     if not question:
         raise HTTPException(
             status_code=400,
@@ -237,23 +181,16 @@ async def query_endpoint(request: QueryRequest):
             question,
             request.top_k,
         )
-
         answer, sources, scores, confidence = await run_in_threadpool(
             extract_answer,
             question,
             retrieved,
         )
-
         return {
             "answer": answer,
             "sources": sources,
             "scores": scores,
             "confidence": confidence,
         }
-
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
-        )
-
+        raise HTTPException(status_code=500, detail=str(e))
